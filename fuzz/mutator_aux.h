@@ -84,4 +84,6 @@ unsigned long prng_uint32(void);
 
 uint32_t uniform_random(uint32_t);
 
+void drop_privs(void);
+
 #endif /* !_MUTATOR_AUX_H */

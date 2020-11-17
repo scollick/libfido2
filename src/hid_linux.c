@@ -114,7 +114,12 @@ get_parent_attr(struct udev_device *dev, const char *subsystem,
 static char *
 get_usb_attr(struct udev_device *dev, const char *attr)
 {
+#ifndef FIDO_FUZZ
 	return (get_parent_attr(dev, "usb", "usb_device", attr));
+#else
+	(void)dev; (void)attr;
+	return (strdup("n/a"));
+#endif
 }
 
 static int

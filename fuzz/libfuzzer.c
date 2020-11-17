@@ -15,16 +15,50 @@
 
 #include "mutator_aux.h"
 
+#include "../openbsd-compat/openbsd-compat.h"
+
 static bool debug;
 static unsigned int flags = MUTATE_ALL;
 static unsigned long long test_fail;
 static unsigned long long test_total;
 static unsigned long long mutate_fail;
 static unsigned long long mutate_total;
+static char user[MAXSTR];
 
 int LLVMFuzzerInitialize(int *, char ***);
 int LLVMFuzzerTestOneInput(const uint8_t *, size_t);
 size_t LLVMFuzzerCustomMutator(uint8_t *, size_t, size_t, unsigned int);
+
+#ifdef __linux__
+#include <unistd.h>
+#include <sys/types.h>
+#include <pwd.h>
+
+void
+drop_privs(void)
+{
+	const struct passwd *pw;
+
+	/* no user provided; continue running */
+	if (strlen(user) == 0)
+		return;
+
+	if ((pw = getpwnam(user)) == NULL)
+		errx(1, "user '%s' does not exist", user);
+
+	if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) < 0)
+		errx(1, "setresgid");
+
+	if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) < 0)
+		errx(1, "setresuid");
+
+	if (getgid() != pw->pw_gid || getegid() != pw->pw_gid)
+		errx(1, "gid/egid incorrect");
+
+	if (getuid() != pw->pw_uid || geteuid() != pw->pw_uid)
+		errx(1, "uid/euid incorrect");
+}
+#endif /* __linux__ */
 
 static int
 save_seed(const char *opt)
@@ -91,6 +125,18 @@ parse_mutate_flags(const char *opt, unsigned int *mutate_flags)
 		errx(1, "--fido-mutate: unknown flag '%s'", f);
 }
 
+static void
+parse_user_flag(const char *opt, char *dst, size_t size)
+{
+	const char *f;
+
+	if ((f = strchr(opt, '=')) == NULL || strlen(++f) == 0)
+		errx(1, "usage: --fido-user=<user>");
+
+	if (strlcpy(dst, f, size) >= size)
+		errx(1, "username too long");
+}
+
 int
 LLVMFuzzerInitialize(int *argc, char ***argv)
 {
@@ -103,6 +149,8 @@ LLVMFuzzerInitialize(int *argc, char ***argv)
 			exit(save_seed((*argv)[i]));
 		} else if (strncmp((*argv)[i], "--fido-mutate=", 14) == 0) {
 			parse_mutate_flags((*argv)[i], &mutate_flags);
+		} else if (strncmp((*argv)[i], "--fido-user=", 12) == 0) {
+			parse_user_flag((*argv)[i], user, sizeof(user));
 		}
 
 	if (mutate_flags)

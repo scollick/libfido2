@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "dummy.h"
 #include "mutator_aux.h"
 #include "fido.h"
 
@@ -21,18 +22,160 @@ extern int fido_hid_get_report_len(const uint8_t *, size_t, size_t *, size_t *);
 struct param {
 	int seed;
 	struct blob report_descriptor;
+	uint8_t device_count;
+	char device_name[MAXSTR];
+	int device_bus;
+	int device_vendor;
+	int device_product;
+	uint8_t list_size;
 };
 
-/*
- * Sample HID report descriptor from the FIDO HID interface of a YubiKey 5.
- */
-static const uint8_t dummy_report_descriptor[] = {
-	0x06, 0xd0, 0xf1, 0x09, 0x01, 0xa1, 0x01, 0x09,
-	0x20, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08,
-	0x95, 0x40, 0x81, 0x02, 0x09, 0x21, 0x15, 0x00,
-	0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x40, 0x91,
-	0x02, 0xc0
-};
+#ifdef __linux__
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
+#include <linux/uhid.h>
+
+/* XXX: we open the file descriptors only once */
+#define UHID_DEVICE_COUNT (255)
+static bool uhid_initialized = false;
+static int uhid_devices[UHID_DEVICE_COUNT];
+
+static int
+uhid_init(void)
+{
+	int ret;
+
+	if (uhid_initialized)
+		return (0);
+
+	for (size_t i = 0; i < UHID_DEVICE_COUNT; i++) {
+		if ((ret = open("/dev/uhid", O_RDWR | O_CLOEXEC)) < 0) {
+			fprintf(stderr, "%s: failed to open /dev/uhid: %s\n",
+				__func__, strerror(errno));
+			goto fail;
+		}
+
+		uhid_devices[i] = ret;
+	}
+
+	uhid_initialized = true;
+
+fail:
+	drop_privs();
+	assert(uhid_initialized); /* failed to open uhid */
+
+	return (uhid_initialized ? 0 : -1);
+}
+
+static int
+uhid_read(int fd, struct uhid_event *ev)
+{
+	ssize_t ret;
+
+	memset(ev, 0, sizeof(*ev));
+
+	if ((ret = read(fd, ev, sizeof(*ev))) < 0 ||
+	    (size_t)ret != sizeof(*ev)) {
+		fprintf(stderr, "%s: read; ret=%zd\n", __func__, ret);
+		return (-1);
+	}
+
+	return (0);
+}
+
+static int
+uhid_write(int fd, const struct uhid_event *ev)
+{
+	ssize_t ret;
+
+	if ((ret = write(fd, ev, sizeof(*ev))) < 0 ||
+	    (size_t)ret != sizeof(*ev)) {
+		fprintf(stderr, "%s: write; ret=%zd, ev->type=%d\n",
+		    __func__, ret, ev->type);
+		return (-1);
+	}
+
+	return (0);
+}
+
+static int
+uhid_expect_event(int fd, uint32_t type)
+{
+	struct uhid_event ev;
+	struct pollfd pfds[1];
+
+	pfds[0].fd = fd;
+	pfds[0].events = POLLIN;
+
+	while (1) {
+		if (poll(pfds, 1, -1) < 0)
+			return (-1);
+
+		if (pfds[0].revents & POLLIN) {
+			if (uhid_read(fd, &ev) < 0)
+				return (-1);
+			if (type == ev.type)
+				return (0);
+		}
+	}
+}
+
+static int
+uhid_create(int fd, const struct param *p)
+{
+	struct uhid_event ev;
+
+	memset(&ev, 0, sizeof(ev));
+
+	ev.type = UHID_CREATE2;
+	strcpy((char*)ev.u.create2.name, p->device_name);
+	memcpy(&ev.u.create2.rd_data[0], dummy_report_descriptor,
+	    sizeof(dummy_report_descriptor));
+	ev.u.create2.rd_size = sizeof(dummy_report_descriptor);
+	ev.u.create2.bus = p->device_bus & 1 ? BUS_USB : BUS_BLUETOOTH;
+	ev.u.create2.vendor = p->device_vendor;
+	ev.u.create2.product = p->device_product;
+	ev.u.create2.version = 0;
+	ev.u.create2.country = 0;
+
+	return (uhid_write(fd, &ev));
+}
+
+static int
+uhid_destroy(int fd)
+{
+	struct uhid_event ev;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = UHID_DESTROY;
+
+	return (uhid_write(fd, &ev));
+}
+
+static int
+uhid_create_wait(int fd, const struct param *p)
+{
+	if (uhid_create(fd, p) < 0 ||
+	    uhid_expect_event(fd, UHID_START) < 0)
+		return (-1);
+
+	return (0);
+}
+
+static int
+uhid_destroy_wait(int fd)
+{
+	if (uhid_destroy(fd) < 0 ||
+	    uhid_expect_event(fd, UHID_STOP) < 0)
+		return (-1);
+
+	return (0);
+}
+
+#endif /* __linux__ */
 
 struct param *
 unpack(const uint8_t *ptr, size_t len)
@@ -47,12 +190,18 @@ unpack(const uint8_t *ptr, size_t len)
 	    cbor.read != len ||
 	    cbor_isa_array(item) == false ||
 	    cbor_array_is_definite(item) == false ||
-	    cbor_array_size(item) != 2 ||
+	    cbor_array_size(item) != 8 ||
 	    (v = cbor_array_handle(item)) == NULL)
 		goto fail;
 
 	if (unpack_int(v[0], &p->seed) < 0 ||
-	    unpack_blob(v[1], &p->report_descriptor) < 0)
+	    unpack_blob(v[1], &p->report_descriptor) < 0 ||
+	    unpack_byte(v[2], &p->device_count) < 0 ||
+	    unpack_string(v[3], p->device_name) < 0 ||
+	    unpack_int(v[4], &p->device_bus) < 0 ||
+	    unpack_int(v[5], &p->device_vendor) < 0 ||
+	    unpack_int(v[6], &p->device_product) < 0 ||
+	    unpack_byte(v[7], &p->list_size) < 0)
 		goto fail;
 
 	ok = 0;
@@ -71,18 +220,24 @@ fail:
 size_t
 pack(uint8_t *ptr, size_t len, const struct param *p)
 {
-	cbor_item_t *argv[2], *array = NULL;
+	cbor_item_t *argv[8], *array = NULL;
 	size_t cbor_alloc_len, cbor_len = 0;
 	unsigned char *cbor = NULL;
 
 	memset(argv, 0, sizeof(argv));
 
-	if ((array = cbor_new_definite_array(2)) == NULL ||
+	if ((array = cbor_new_definite_array(8)) == NULL ||
 	    (argv[0] = pack_int(p->seed)) == NULL ||
-	    (argv[1] = pack_blob(&p->report_descriptor)) == NULL)
+	    (argv[1] = pack_blob(&p->report_descriptor)) == NULL ||
+	    (argv[2] = pack_byte(p->device_count)) == NULL ||
+	    (argv[3] = pack_string(p->device_name)) == NULL ||
+	    (argv[4] = pack_int(p->device_bus)) == NULL ||
+	    (argv[5] = pack_int(p->device_vendor)) == NULL ||
+	    (argv[6] = pack_int(p->device_product)) == NULL ||
+	    (argv[7] = pack_byte(p->list_size)) == NULL)
 		goto fail;
 
-	for (size_t i = 0; i < 2; i++)
+	for (size_t i = 0; i < 8; i++)
 		if (cbor_array_push(array, argv[i]) == false)
 			goto fail;
 
@@ -94,7 +249,7 @@ pack(uint8_t *ptr, size_t len, const struct param *p)
 
 	memcpy(ptr, cbor, cbor_len);
 fail:
-	for (size_t i = 0; i < 2; i++)
+	for (size_t i = 0; i < 8; i++)
 		if (argv[i])
 			cbor_decref(&argv[i]);
 
@@ -114,6 +269,14 @@ pack_dummy(uint8_t *ptr, size_t len)
 	size_t blob_len;
 
 	memset(&dummy, 0, sizeof(dummy));
+
+	dummy.device_count = 1;
+	dummy.device_bus = BUS_USB;
+	dummy.device_vendor = 0x1050;
+	dummy.device_product = 0x0407;
+	dummy.list_size = 64;
+
+	strlcpy(dummy.device_name, "device", sizeof(dummy.device_name));
 
 	dummy.report_descriptor.len = sizeof(dummy_report_descriptor);
 	memcpy(&dummy.report_descriptor.body, &dummy_report_descriptor,
@@ -153,12 +316,64 @@ get_report_len(const struct param *p)
 	consume(&report_out_len, sizeof(report_out_len));
 }
 
+#ifdef __linux__
+static void
+dev_info_manifest(const struct param *p)
+{
+	fido_dev_info_t *devlist;
+	const fido_dev_info_t *devinfo;
+	size_t ndevs;
+	int16_t x;
+	int r;
+
+	devlist = fido_dev_info_new(p->list_size);
+	r = fido_dev_info_manifest(devlist, p->list_size, &ndevs);
+	consume_str(fido_strerr(r));
+
+	for (size_t i = 0; i < ndevs; i++) {
+		devinfo = fido_dev_info_ptr(devlist, i);
+
+		consume(fido_dev_info_path(devinfo),
+		    xstrlen(fido_dev_info_path(devinfo)));
+		consume(fido_dev_info_manufacturer_string(devinfo),
+		    xstrlen(fido_dev_info_manufacturer_string(devinfo)));
+		consume(fido_dev_info_product_string(devinfo),
+		    xstrlen(fido_dev_info_product_string(devinfo)));
+
+		x = fido_dev_info_vendor(devinfo);
+		consume(&x, sizeof(x));
+		x = fido_dev_info_product(devinfo);
+		consume(&x, sizeof(x));
+	}
+
+	fido_dev_info_free(&devlist, ndevs);
+}
+#endif /* __linux__ */
+
 void
 test(const struct param *p)
 {
 	prng_init((unsigned int)p->seed);
 	fido_init(FIDO_DEBUG);
 	fido_set_log_handler(consume_str);
+
+#ifdef __linux__
+	/* these tests require /dev/uhid, and initial root privileges */
+	if (uhid_init() < 0)
+		return;
+
+	/* limit the number of virtual devices created */
+	if (p->device_count > UHID_DEVICE_COUNT)
+		return;
+
+	for (uint8_t i = 0; i < p->device_count; ++i)
+		uhid_create_wait(uhid_devices[i], p);
+
+	dev_info_manifest(p);
+
+	for (uint8_t i = 0; i < p->device_count; ++i)
+		uhid_destroy_wait(uhid_devices[i]);
+#endif
 
 	get_usage(p);
 	get_report_len(p);
@@ -170,6 +385,13 @@ mutate(struct param *p, unsigned int seed, unsigned int flags) NO_MSAN
 	if (flags & MUTATE_SEED)
 		p->seed = (int)seed;
 
-	if (flags & MUTATE_PARAM)
+	if (flags & MUTATE_PARAM) {
 		mutate_blob(&p->report_descriptor);
+		mutate_byte(&p->device_count);
+		mutate_string(p->device_name);
+		mutate_int(&p->device_bus);
+		mutate_int(&p->device_vendor);
+		mutate_int(&p->device_product);
+		mutate_byte(&p->list_size);
+	}
 }
