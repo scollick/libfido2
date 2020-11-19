@@ -4,6 +4,17 @@
  * license that can be found in the LICENSE file.
  */
 
+#ifdef __linux__
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#include <linux/uhid.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#endif
+
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -31,55 +42,35 @@ struct param {
 };
 
 #ifdef __linux__
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <poll.h>
-#include <linux/uhid.h>
+#define UHID_MAX	255
+#define UHID_PATH	"/dev/uhid"
 
-/* XXX: we open the file descriptors only once */
-#define UHID_DEVICE_COUNT (255)
-static bool uhid_initialized = false;
-static int uhid_devices[UHID_DEVICE_COUNT];
+static bool uhid_ok = false;
+static int uhid_fd[UHID_MAX];
 
-static int
+static void
 uhid_init(void)
 {
-	int ret;
+	if (uhid_ok)
+		return;
 
-	if (uhid_initialized)
-		return (0);
+	for (size_t i = 0; i < UHID_MAX; i++)
+		if ((uhid_fd[i] = open(UHID_PATH, O_RDWR | O_CLOEXEC)) == -1)
+			err(1, "%s: open %s", __func__, UHID_PATH);
 
-	for (size_t i = 0; i < UHID_DEVICE_COUNT; i++) {
-		if ((ret = open("/dev/uhid", O_RDWR | O_CLOEXEC)) < 0) {
-			fprintf(stderr, "%s: failed to open /dev/uhid: %s\n",
-				__func__, strerror(errno));
-			goto fail;
-		}
-
-		uhid_devices[i] = ret;
-	}
-
-	uhid_initialized = true;
-
-fail:
 	drop_privs();
-	assert(uhid_initialized); /* failed to open uhid */
-
-	return (uhid_initialized ? 0 : -1);
+	uhid_ok = true;
 }
 
 static int
 uhid_read(int fd, struct uhid_event *ev)
 {
-	ssize_t ret;
+	ssize_t n;
 
 	memset(ev, 0, sizeof(*ev));
 
-	if ((ret = read(fd, ev, sizeof(*ev))) < 0 ||
-	    (size_t)ret != sizeof(*ev)) {
-		fprintf(stderr, "%s: read; ret=%zd\n", __func__, ret);
+	if ((n = read(fd, ev, sizeof(*ev))) < 0 || (size_t)n != sizeof(*ev)) {
+		warn("%s: read: %zd", __func__, n);
 		return (-1);
 	}
 
@@ -89,12 +80,10 @@ uhid_read(int fd, struct uhid_event *ev)
 static int
 uhid_write(int fd, const struct uhid_event *ev)
 {
-	ssize_t ret;
+	ssize_t n;
 
-	if ((ret = write(fd, ev, sizeof(*ev))) < 0 ||
-	    (size_t)ret != sizeof(*ev)) {
-		fprintf(stderr, "%s: write; ret=%zd, ev->type=%d\n",
-		    __func__, ret, ev->type);
+	if ((n = write(fd, ev, sizeof(*ev))) < 0 || (size_t)n != sizeof(*ev)) {
+		warn("%s: write: %zd", __func__, n);
 		return (-1);
 	}
 
@@ -102,22 +91,25 @@ uhid_write(int fd, const struct uhid_event *ev)
 }
 
 static int
-uhid_expect_event(int fd, uint32_t type)
+uhid_wait(int fd, uint32_t event)
 {
 	struct uhid_event ev;
-	struct pollfd pfds[1];
+	struct pollfd pfd;
 
-	pfds[0].fd = fd;
-	pfds[0].events = POLLIN;
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.events = POLLIN;
+	pfd.fd = fd;
 
-	while (1) {
-		if (poll(pfds, 1, -1) < 0)
+	for (;;) {
+		if (poll(&pfd, 1, -1) < 0) {
+			warn("%s: poll", __func__);
 			return (-1);
+		}
 
-		if (pfds[0].revents & POLLIN) {
+		if (pfd.revents & POLLIN) {
 			if (uhid_read(fd, &ev) < 0)
 				return (-1);
-			if (type == ev.type)
+			if (event == ev.type)
 				return (0);
 		}
 	}
@@ -131,15 +123,15 @@ uhid_create(int fd, const struct param *p)
 	memset(&ev, 0, sizeof(ev));
 
 	ev.type = UHID_CREATE2;
-	strcpy((char*)ev.u.create2.name, p->device_name);
-	memcpy(&ev.u.create2.rd_data[0], dummy_report_descriptor,
+	strlcpy((char *)ev.u.create2.name, p->device_name,
+	    sizeof(ev.u.create2.name));
+	assert(sizeof(dummy_report_descriptor) <= sizeof(ev.u.create2.rd_data));
+	memcpy(ev.u.create2.rd_data, dummy_report_descriptor,
 	    sizeof(dummy_report_descriptor));
 	ev.u.create2.rd_size = sizeof(dummy_report_descriptor);
 	ev.u.create2.bus = p->device_bus & 1 ? BUS_USB : BUS_BLUETOOTH;
 	ev.u.create2.vendor = p->device_vendor;
 	ev.u.create2.product = p->device_product;
-	ev.u.create2.version = 0;
-	ev.u.create2.country = 0;
 
 	return (uhid_write(fd, &ev));
 }
@@ -158,8 +150,7 @@ uhid_destroy(int fd)
 static int
 uhid_create_wait(int fd, const struct param *p)
 {
-	if (uhid_create(fd, p) < 0 ||
-	    uhid_expect_event(fd, UHID_START) < 0)
+	if (uhid_create(fd, p) < 0 || uhid_wait(fd, UHID_START) < 0)
 		return (-1);
 
 	return (0);
@@ -168,13 +159,11 @@ uhid_create_wait(int fd, const struct param *p)
 static int
 uhid_destroy_wait(int fd)
 {
-	if (uhid_destroy(fd) < 0 ||
-	    uhid_expect_event(fd, UHID_STOP) < 0)
+	if (uhid_destroy(fd) < 0 || uhid_wait(fd, UHID_STOP) < 0)
 		return (-1);
 
 	return (0);
 }
-
 #endif /* __linux__ */
 
 struct param *
@@ -358,21 +347,19 @@ test(const struct param *p)
 	fido_set_log_handler(consume_str);
 
 #ifdef __linux__
-	/* these tests require /dev/uhid, and initial root privileges */
-	if (uhid_init() < 0)
-		return;
+	uhid_init();
 
 	/* limit the number of virtual devices created */
-	if (p->device_count > UHID_DEVICE_COUNT)
+	if (p->device_count > UHID_MAX)
 		return;
 
 	for (uint8_t i = 0; i < p->device_count; ++i)
-		uhid_create_wait(uhid_devices[i], p);
+		uhid_create_wait(uhid_fd[i], p);
 
 	dev_info_manifest(p);
 
 	for (uint8_t i = 0; i < p->device_count; ++i)
-		uhid_destroy_wait(uhid_devices[i]);
+		uhid_destroy_wait(uhid_fd[i]);
 #endif
 
 	get_usage(p);

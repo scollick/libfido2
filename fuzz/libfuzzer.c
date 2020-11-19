@@ -4,8 +4,11 @@
  * license that can be found in the LICENSE file.
  */
 
+#include <sys/types.h>
+
 #include <err.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,47 +21,38 @@
 #include "../openbsd-compat/openbsd-compat.h"
 
 static bool debug;
+static char user[MAXUSER];
 static unsigned int flags = MUTATE_ALL;
 static unsigned long long test_fail;
 static unsigned long long test_total;
 static unsigned long long mutate_fail;
 static unsigned long long mutate_total;
-static char user[MAXSTR];
 
 int LLVMFuzzerInitialize(int *, char ***);
 int LLVMFuzzerTestOneInput(const uint8_t *, size_t);
 size_t LLVMFuzzerCustomMutator(uint8_t *, size_t, size_t, unsigned int);
-
-#ifdef __linux__
-#include <unistd.h>
-#include <sys/types.h>
-#include <pwd.h>
 
 void
 drop_privs(void)
 {
 	const struct passwd *pw;
 
-	/* no user provided; continue running */
 	if (strlen(user) == 0)
 		return;
 
 	if ((pw = getpwnam(user)) == NULL)
 		errx(1, "user '%s' does not exist", user);
 
-	if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) < 0)
+	if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) == -1)
 		errx(1, "setresgid");
-
-	if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) < 0)
+	if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) == -1)
 		errx(1, "setresuid");
 
 	if (getgid() != pw->pw_gid || getegid() != pw->pw_gid)
-		errx(1, "gid/egid incorrect");
-
+		errx(1, "gid/egid mismatch");
 	if (getuid() != pw->pw_uid || geteuid() != pw->pw_uid)
-		errx(1, "uid/euid incorrect");
+		errx(1, "uid/euid mismatch");
 }
-#endif /* __linux__ */
 
 static int
 save_seed(const char *opt)
@@ -126,14 +120,14 @@ parse_mutate_flags(const char *opt, unsigned int *mutate_flags)
 }
 
 static void
-parse_user_flag(const char *opt, char *dst, size_t size)
+parse_user(const char *opt, char *userptr, size_t userlen)
 {
 	const char *f;
 
 	if ((f = strchr(opt, '=')) == NULL || strlen(++f) == 0)
 		errx(1, "usage: --fido-user=<user>");
 
-	if (strlcpy(dst, f, size) >= size)
+	if (strlcpy(userptr, f, userlen) >= userlen)
 		errx(1, "username too long");
 }
 
@@ -150,7 +144,7 @@ LLVMFuzzerInitialize(int *argc, char ***argv)
 		} else if (strncmp((*argv)[i], "--fido-mutate=", 14) == 0) {
 			parse_mutate_flags((*argv)[i], &mutate_flags);
 		} else if (strncmp((*argv)[i], "--fido-user=", 12) == 0) {
-			parse_user_flag((*argv)[i], user, sizeof(user));
+			parse_user((*argv)[i], user, sizeof(user));
 		}
 
 	if (mutate_flags)
