@@ -315,7 +315,9 @@ dev_info_manifest(const struct param *p)
 	int16_t x;
 	int r;
 
-	devlist = fido_dev_info_new(p->list_size);
+	if ((devlist = fido_dev_info_new(p->list_size)) == NULL)
+		return;
+
 	r = fido_dev_info_manifest(devlist, p->list_size, &ndevs);
 	consume_str(fido_strerr(r));
 
