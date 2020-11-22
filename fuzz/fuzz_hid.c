@@ -95,24 +95,30 @@ uhid_wait(int fd, uint32_t event)
 {
 	struct uhid_event ev;
 	struct pollfd pfd;
+	int r;
 
 	memset(&pfd, 0, sizeof(pfd));
 	pfd.events = POLLIN;
 	pfd.fd = fd;
 
 	for (;;) {
-		if (poll(&pfd, 1, -1) < 0) {
+		if ((r = poll(&pfd, 1, -1)) > 0) {
+			if (uhid_read(fd, &ev) < 0) {
+				warn("%s: read", __func__);
+				break;
+			}
+			if (ev.type != event)
+				continue;
+			return (0);
+		} else if (r == 0)
+			break;
+		else if (errno != EINTR) {
 			warn("%s: poll", __func__);
-			return (-1);
-		}
-
-		if (pfd.revents & POLLIN) {
-			if (uhid_read(fd, &ev) < 0)
-				return (-1);
-			if (event == ev.type)
-				return (0);
+			break;
 		}
 	}
+
+	return (-1);
 }
 
 static int
