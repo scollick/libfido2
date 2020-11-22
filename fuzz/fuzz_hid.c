@@ -42,7 +42,7 @@ struct param {
 };
 
 #ifdef __linux__
-#define UHID_MAX	255
+#define UHID_MAX	10
 #define UHID_PATH	"/dev/uhid"
 
 static bool uhid_ok = false;
