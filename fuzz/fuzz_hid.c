@@ -361,13 +361,13 @@ test(const struct param *p)
 	if (p->device_count > UHID_MAX)
 		return;
 
-	for (uint8_t i = 0; i < p->device_count; ++i)
-		uhid_create_wait(uhid_fd[i], p);
+	for (uint8_t i = 0; i < p->device_count; i++)
+		assert(uhid_create_wait(uhid_fd[i], p) == 0);
 
 	dev_info_manifest(p);
 
-	for (uint8_t i = 0; i < p->device_count; ++i)
-		uhid_destroy_wait(uhid_fd[i]);
+	for (uint8_t i = 0; i < p->device_count; i++)
+		assert(uhid_destroy_wait(uhid_fd[i]) == 0);
 #endif
 
 	get_usage(p);
